@@ -1,0 +1,38 @@
+# Maxfiy sozlamalar — HECH QACHON commit qilinmasin
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Test / namuna fayllar (kerak bo'lsa olib tashlang)
+test_balance_sheet.pdf
+test_balance_sheet.xlsx
+
+# IDE / muharrir
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Loglar
+*.log
+
+# Claude Code shaxsiy lokal sozlama
+.claude/settings.local.json

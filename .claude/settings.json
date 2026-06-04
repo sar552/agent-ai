@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(uv pip install --python \"c:\\\\Users\\\\Loq\\\\Desktop\\\\agent ai\\\\.venv\\\\Scripts\\\\python.exe\" openpyxl)"
+    ]
+  }
+}
