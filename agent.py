@@ -24,6 +24,7 @@ import ast
 import csv
 import json
 import time
+import datetime
 import requests
 from pathlib import Path
 
@@ -278,6 +279,80 @@ def erp_profit_breakdown(from_date, to_date, by="item_code", customer=None, top=
                            "kiritilmagan yoki bu davrda sotuv yo'q.", "items": []}
     return {"by": by, "customer": customer,
             "items": [dict(key=k, **v) for k, v in ranked]}
+
+
+# ============ JORIY QARZDORLIK (mijoz / yetkazib beruvchi qoldig'i) ============
+def _today():
+    """Bugungi sana (YYYY-MM-DD)."""
+    return datetime.date.today().isoformat()
+
+
+def _year_start():
+    """Joriy yil boshi (YYYY-01-01) — qarz hisobi uchun sukutdagi 'from_date'."""
+    return datetime.date.today().replace(month=1, day=1).isoformat()
+
+
+def erp_party_debt(party_type, party=None, from_date=None, to_date=None, company=None, top=100):
+    """
+    Mijoz (customer) yoki yetkazib beruvchi (supplier/postavshik) JORIY QARZDORLIGINI
+    tegishli Ledger Summary hisobotidan oladi:
+      party_type="customer" -> 'Customer Ledger Summary'  (mijoz bizga qarzdor)
+      party_type="supplier" -> 'Supplier Ledger Summary'  (biz yetkazib beruvchiga qarzdormiz)
+    closing_balance = shu kunga JORIY qoldiq qarz. party berilsa faqat o'sha kontragent.
+    """
+    pt = (party_type or "customer").strip().lower()
+    if pt.startswith("sup") or pt in ("postavshik", "yetkazib beruvchi", "taminotchi", "ta'minotchi"):
+        report, ptype, role = "Supplier Ledger Summary", "Supplier", "yetkazib beruvchi"
+    else:
+        report, ptype, role = "Customer Ledger Summary", "Customer", "mijoz"
+
+    comp = company or COMPANY
+    if not comp:
+        return {"error": "Kompaniya aniqlanmadi. SOZLAMALAR'dagi COMPANY ni to'ldiring "
+                         "yoki so'rovda kompaniya nomini ayting."}
+
+    to_d = to_date or _today()
+    filters = {
+        "company": comp,
+        "from_date": from_date or _year_start(),
+        "to_date": to_d,
+        "party_type": ptype,
+    }
+    msg = _run_query_report(report, filters)
+    rows = _rows_as_dicts(msg)
+
+    parties = []
+    for r in rows:
+        name = r.get("party_name") or r.get("party") or ""
+        if not name:
+            continue
+        parties.append({
+            "party": name,
+            "closing_balance": float(r.get("closing_balance") or 0),
+            "invoiced": float(r.get("invoiced_amount") or 0),
+            "paid": float(r.get("paid_amount") or 0),
+            "opening": float(r.get("opening_balance") or 0),
+        })
+
+    # Aniq kontragent so'ralgan bo'lsa — nom bo'yicha filtrlaymiz (qism-mos, registrsiz)
+    if party:
+        q = str(party).strip().lower()
+        matched = [p for p in parties if q in (p["party"] or "").lower()]
+        if not matched:
+            return {"report": report, "party_type": ptype,
+                    "warning": f"'{party}' nomli {role} topilmadi yoki uning qarzi yo'q.",
+                    "as_of": to_d, "parties": []}
+        matched.sort(key=lambda p: p["closing_balance"], reverse=True)
+        return {"report": report, "party_type": ptype, "as_of": to_d,
+                "total_outstanding": round(sum(p["closing_balance"] for p in matched), 2),
+                "count": len(matched), "parties": matched}
+
+    # Umumiy ro'yxat: qoldig'i bor (qarzdor) larni kattadan kichikka saralaymiz
+    debtors = [p for p in parties if abs(p["closing_balance"]) > 0.005]
+    debtors.sort(key=lambda p: p["closing_balance"], reverse=True)
+    return {"report": report, "party_type": ptype, "as_of": to_d,
+            "total_outstanding": round(sum(p["closing_balance"] for p in debtors), 2),
+            "count": len(debtors), "parties": debtors[:top]}
 
 
 # ============ HISOBOTNI FAYL (Excel/CSV/PDF) qilib yuborish ===================
@@ -545,6 +620,16 @@ def run_tool(name, args, chat_id=None):
                 args.get("company"),
             )
             return json.dumps(data, ensure_ascii=False, default=str)
+        elif name == "get_party_debt":
+            data = erp_party_debt(
+                args["party_type"],
+                args.get("party"),
+                args.get("from_date"),
+                args.get("to_date"),
+                args.get("company"),
+                args.get("top", 100),
+            )
+            return json.dumps(data, ensure_ascii=False, default=str)
         else:
             return f"Noma'lum tool: {name}"
     except Exception as e:
@@ -699,6 +784,36 @@ TOOLS = [
             "required": ["report_name"],
         },
     },
+    {
+        "name": "get_party_debt",
+        "description": (
+            "JORIY QARZDORLIKNI (qoldiq qarz) aniqlaydi. Mijoz qarzi uchun ERPNext'ning "
+            "'Customer Ledger Summary', yetkazib beruvchi (postavshik) qarzi uchun "
+            "'Supplier Ledger Summary' hisobotidan oladi. closing_balance = shu kunga JORIY "
+            "qoldiq qarz.\n"
+            "QARZ/QARZDORLIK savollari uchun DOIM SHU tool'ni ishlat — boshqa hisobotlardan "
+            "(General Ledger, Accounts Receivable, erp_list va h.k.) qarz QIDIRMA.\n"
+            "  * 'mijoz qarzi', 'mijozlar qarzdorligi', 'kim qancha qarz', 'falon mijoz qancha "
+            "qarzi bor' => party_type='customer'.\n"
+            "  * 'yetkazib beruvchi / postavshik / supplier qarzi', 'biz kimga qarzdormiz' "
+            "=> party_type='supplier'.\n"
+            "Aniq bitta kontragent so'ralsa party='Nomi' ber. Sana berilmasa joriy (bugungi) "
+            "holatni qaytaradi — odatda sana shart emas."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "party_type": {"type": "string", "enum": ["customer", "supplier"],
+                               "description": "customer = mijoz qarzi; supplier = yetkazib beruvchi/postavshik qarzi"},
+                "party": {"type": "string", "description": "Aniq mijoz/yetkazib beruvchi nomi (ixtiyoriy; bo'lmasa hammasi)"},
+                "from_date": {"type": "string", "description": "YYYY-MM-DD (ixtiyoriy, sukut: yil boshi)"},
+                "to_date": {"type": "string", "description": "YYYY-MM-DD (ixtiyoriy, sukut: bugun)"},
+                "company": {"type": "string", "description": "Kompaniya nomi (sozlamada bo'lsa shart emas)"},
+                "top": {"type": "integer", "description": "Nechta qarzdor (default 100)"},
+            },
+            "required": ["party_type"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = f"""Sen — ERPNext bo'yicha o'zbek tilida javob beradigan yordamchi assistantsan.
@@ -758,6 +873,33 @@ HISOBOTNI TAHLIL QILISH (CFO / moliyachi sifatida):
   foyda marjasi, qarz/sarmoya), oylar bo'yicha TREND (o'sish/pasayish %), e'tibor
   beriladigan xavflar, va 3-5 ta ANIQ amaliy tavsiya. Raqamlarni o'qiladigan qil.
 - Tahlil uchun bir nechta hisobotni birga olib solishtirsang bo'ladi (masalan P&L + Cash Flow).
+
+JORIY QARZDORLIK (qarz / qoldiq):
+- Qarz/qarzdorlik so'ralganda DOIM get_party_debt tool'ini ishlat. Boshqa hisobot yoki
+  erp_list bilan qarz QIDIRMA — har xil joydan izlama, faqat shu tool to'g'ri javob beradi.
+- "Mijoz qarzi", "mijozlar qarzdorligi", "kim qancha qarzdor", "falon mijozning qarzi"
+  => party_type="customer" (Customer Ledger Summary).
+- "Yetkazib beruvchi / postavshik / supplier / ta'minotchi qarzi", "biz kimga qarzdormiz"
+  => party_type="supplier" (Supplier Ledger Summary).
+- Aniq bitta kontragent so'ralsa party="Nomi" ber; bo'lmasa hammasini qaytaradi.
+- closing_balance = JORIY qoldiq qarz. Customer uchun musbat = mijoz BIZGA qarzdor;
+  supplier uchun musbat = BIZ yetkazib beruvchiga qarzdormiz. Buni javobda aniq ayt.
+- Sana odatda shart emas (joriy holat). Foydalanuvchi "falon sanaga" desa to_date ber.
+
+JAVOBNI CHIROYLI YOZISH (Telegram):
+- Telegram HTML ni qo'llab-quvvatlaydi. Faqat <b>...</b> (qalin) va <i>...</i> (kursiv)
+  teglaridan foydalan. Boshqa teg ishlatma.
+- Matnda < > & belgilari bo'lsa (mijoz/tovar nomida) ularni &lt; &gt; &amp; bilan yoz.
+- Pul summalarini mingliklarga ajrat: 12 500 000 so'm (bo'sh joy bilan, kasrsiz).
+- Sarlavhani <b>qalin</b> qil, ro'yxatni raqamlab ber, mos emoji ishlat
+  (💰 jami, 📊 hisobot, 🔴 qarzdor, 🟢 qarzi yo'q, ⬆️⬇️ o'sish/pasayish). Oxirida
+  <b>Jami: ...</b> qatorini qo'sh. Qisqa, ortiqcha so'zsiz, lekin chiroyli tartibli yoz.
+- Qarzdorlik javobiga namuna:
+  💰 <b>Mijozlar qarzdorligi</b> (04.06.2026 holatiga)
+  1. Alisher Savdo — <b>45 200 000 so'm</b>
+  2. Bobur LLC — <b>12 800 000 so'm</b>
+  ➖➖➖➖➖
+  <b>Jami: 58 000 000 so'm</b> (12 ta mijoz)
 
 Hech qachon ma'lumotni o'zingdan to'qima — faqat tool natijasiga asoslanib javob ber.
 Agar tool xato qaytarsa, foydalanuvchiga sodda tilda tushuntir."""
@@ -861,10 +1003,27 @@ SESSIONS = {}   # chat_id -> messages tarixi (oddiy xotira; restartda o'chadi)
 ERP_TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 
-def tg_send(chat_id, text):
+def tg_send(chat_id, text, parse_mode="HTML"):
+    """Matnni Telegram'ga yuboradi (uzun bo'lsa 4000 belgidan bo'laklab).
+    Sukut bo'yicha HTML rejimida (<b>/<i> chiroyli ko'rinish uchun). Agar HTML
+    noto'g'ri bo'lib Telegram qabul qilmasa, o'sha bo'lakni oddiy matn qilib qayta yuboramiz —
+    shunda javob baribir yetib boradi (formatsiz bo'lsa ham)."""
     for i in range(0, len(text), 4000):
-        requests.post(f"{ERP_TG_API}/sendMessage",
-                      data={"chat_id": chat_id, "text": text[i:i + 4000]}, timeout=30)
+        chunk = text[i:i + 4000]
+        data = {"chat_id": chat_id, "text": chunk}
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        try:
+            r = requests.post(f"{ERP_TG_API}/sendMessage", data=data, timeout=30)
+            if parse_mode and not r.json().get("ok", True):
+                requests.post(f"{ERP_TG_API}/sendMessage",
+                              data={"chat_id": chat_id, "text": chunk}, timeout=30)
+        except Exception:
+            try:
+                requests.post(f"{ERP_TG_API}/sendMessage",
+                              data={"chat_id": chat_id, "text": chunk}, timeout=30)
+            except Exception:
+                pass
 
 
 def tg_send_document(chat_id, filename, content, caption=None):
